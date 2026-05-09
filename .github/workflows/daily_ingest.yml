@@ -41,45 +41,9 @@ jobs:
       - name: Validate gaps
         id: validate
         run: |
-          python - <<'PYEOF'
-          import sys
-          from datetime import datetime, timezone
-          import pyarrow.parquet as pq
-
-          target = "${{ steps.date.outputs.target }}"
-          path = f"/tmp/ticks/ticks_{target}.parquet"
-
-          table = pq.read_table(path, columns=["timestamp_utc"])
-          ts = sorted(table.column("timestamp_utc").to_pylist())
-
-          # Derive window bounds for 07:00–22:00 UTC in milliseconds.
-          day_epoch_ms = int(
-              datetime.strptime(target, "%Y-%m-%d")
-              .replace(tzinfo=timezone.utc)
-              .timestamp()
-          ) * 1000
-          window_start = day_epoch_ms + 7 * 3600 * 1000
-          window_end   = day_epoch_ms + 22 * 3600 * 1000
-
-          window = [t for t in ts if window_start <= t <= window_end]
-
-          if len(window) < 2:
-              print("Fewer than 2 ticks in 07:00–22:00 UTC window — skipping gap check")
-              sys.exit(0)
-
-          diffs = [window[i + 1] - window[i] for i in range(len(window) - 1)]
-          max_gap_ms = max(diffs)
-
-          if max_gap_ms > 600_000:
-              print(
-                  f"ERROR: gap of {max_gap_ms / 60_000:.1f} min detected during "
-                  f"07:00–22:00 UTC (threshold: 10 min)",
-                  file=sys.stderr,
-              )
-              sys.exit(1)
-
-          print(f"Gap validation passed. Max gap in window: {max_gap_ms / 60_000:.2f} min")
-          PYEOF
+          python validate.py \
+            /tmp/ticks/ticks_${{ steps.date.outputs.target }}.parquet \
+            ${{ steps.date.outputs.target }}
 
       - name: Upload to HF
         id: upload
