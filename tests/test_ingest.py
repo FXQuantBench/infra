@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from ingest_historical import (
+    _save_raw,
     _to_ms,
     default_end,
     fetch_ticks,
@@ -148,6 +149,35 @@ class TestFetchTicks:
         assert list(result.columns) == [
             "timestamp_utc", "bid", "ask", "bid_volume", "ask_volume", "is_interpolated"
         ]
+
+    @patch("ingest_historical.dukascopy_python.fetch")
+    def test_raw_dir_saves_bid_and_ask_parquets(self, mock_fetch, tmp_path):
+        """With raw_dir set, raw bid and ask files must be written before merge."""
+        bid_df = make_tick_df([BASE_MS], [1.30], [1.0], [0.0], [0.0])
+        ask_df = make_tick_df([BASE_MS + 100], [0.0], [0.0], [1.3002], [0.8])
+        mock_fetch.side_effect = [bid_df, ask_df]
+
+        raw_dir = tmp_path / "raw"
+        raw_dir.mkdir()
+        fetch_ticks(date(2023, 1, 1), raw_dir=raw_dir)
+
+        assert (raw_dir / "GBPUSD_bid_2023-01-01.parquet").exists()
+        assert (raw_dir / "GBPUSD_ask_2023-01-01.parquet").exists()
+
+    @patch("ingest_historical.dukascopy_python.fetch")
+    def test_raw_parquet_contains_original_columns(self, mock_fetch, tmp_path):
+        bid_df = make_tick_df([BASE_MS], [1.30], [1.0], [0.0], [0.0])
+        ask_df = make_tick_df([BASE_MS + 100], [0.0], [0.0], [1.3002], [0.8])
+        mock_fetch.side_effect = [bid_df, ask_df]
+
+        raw_dir = tmp_path / "raw"
+        raw_dir.mkdir()
+        fetch_ticks(date(2023, 1, 1), raw_dir=raw_dir)
+
+        import pyarrow.parquet as pq
+        raw_bid = pq.read_table(str(raw_dir / "GBPUSD_bid_2023-01-01.parquet")).to_pandas()
+        assert "bidPrice" in raw_bid.columns
+        assert "bidVolume" in raw_bid.columns
 
 
 # ---------------------------------------------------------------------------
@@ -306,12 +336,13 @@ class TestParseArgs:
         with patch.object(
             sys, "argv",
             ["ingest_historical.py", "--start", "2023-01-01", "--end", "2023-01-31",
-             "--output-dir", "/tmp/ticks"],
+             "--output-dir", "/tmp/ticks", "--raw-dir", "/tmp/raw"],
         ):
             args = parse_args()
         assert args.start == "2023-01-01"
         assert args.end == "2023-01-31"
         assert args.output_dir == "/tmp/ticks"
+        assert args.raw_dir == "/tmp/raw"
 
 
 # ---------------------------------------------------------------------------

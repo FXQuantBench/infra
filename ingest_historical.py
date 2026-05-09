@@ -7,12 +7,18 @@ Usage
 
 # Local-only (for workflow: write Parquet, skip HF upload):
     python ingest_historical.py --start 2024-05-08 --end 2024-05-08 --output-dir /tmp/ticks
+
+# Save raw bid/ask before merge (for debugging merge logic):
+    python ingest_historical.py --start 2023-01-01 --end 2023-01-01 \
+        --output-dir /tmp/ticks --raw-dir /tmp/raw
 """
 
 import argparse
 import hashlib
 import json
+import os
 import tempfile
+import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -55,8 +61,26 @@ def _to_ms(series: pd.Series) -> pd.Series:
     return series.astype("int64") // 1_000_000
 
 
-def fetch_ticks(day: date) -> Optional[pd.DataFrame]:
+def _save_raw(df: pd.DataFrame, raw_dir: Path, side: str, day: date) -> None:
+    """Persist a raw dukascopy DataFrame (pre-merge) as Parquet."""
+    path = raw_dir / f"GBPUSD_{side}_{day.isoformat()}.parquet"
+    table = pa.Table.from_pandas(df, preserve_index=True)
+    pq.write_table(table, str(path), compression="zstd")
+    print(f"  Raw {side} saved → {path}")
+
+
+def fetch_ticks(
+    day: date, raw_dir: Optional[Path] = None
+) -> Optional[pd.DataFrame]:
     """Download and merge bid/ask ticks for *day*.
+
+    Parameters
+    ----------
+    day:
+        Calendar day to fetch.
+    raw_dir:
+        If given, write the raw (pre-merge) bid and ask DataFrames as Parquet
+        to this directory before any normalisation or merging.
 
     Returns a DataFrame with schema columns or None if no data.
     """
@@ -82,6 +106,11 @@ def fetch_ticks(day: date) -> Optional[pd.DataFrame]:
     )
     if df_ask is None or df_ask.empty:
         return None
+
+    # --- Optionally persist raw data before any transformation ---
+    if raw_dir is not None:
+        _save_raw(df_bid, raw_dir, "bid", day)
+        _save_raw(df_ask, raw_dir, "ask", day)
 
     # --- Normalise bid side ---
     df_bid = df_bid.reset_index()
@@ -231,6 +260,15 @@ def parse_args() -> argparse.Namespace:
             "Directory is created if it does not exist."
         ),
     )
+    parser.add_argument(
+        "--raw-dir",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Save raw (pre-merge) bid and ask Parquet files here for each day. "
+            "Useful for debugging merge logic. Directory is created if it does not exist."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -249,11 +287,16 @@ def main() -> None:
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
+    raw_dir: Optional[Path] = None
+    if args.raw_dir is not None:
+        raw_dir = Path(args.raw_dir)
+        raw_dir.mkdir(parents=True, exist_ok=True)
+
     current = start
     while current <= end:
         print(f"Processing {current.isoformat()} ...")
         try:
-            df = fetch_ticks(current)
+            df = fetch_ticks(current, raw_dir=raw_dir)
         except Exception as exc:
             print(f"  WARNING: fetch failed — {exc}")
             current += timedelta(days=1)
@@ -273,7 +316,6 @@ def main() -> None:
             tmp_fd, tmp_name = tempfile.mkstemp(suffix=".parquet")
             tmp_path = Path(tmp_name)
             try:
-                import os
                 os.close(tmp_fd)
                 write_parquet(df, tmp_path)
                 upload_and_update_manifest(api, tmp_path, current)
@@ -282,6 +324,9 @@ def main() -> None:
                 tmp_path.unlink(missing_ok=True)
 
         current += timedelta(days=1)
+        # Brief pause between days to avoid saturating Dukascopy's CDN.
+        # Each day triggers up to 48 hourly-file requests (24 bid + 24 ask).
+        time.sleep(0.5)
 
 
 if __name__ == "__main__":
