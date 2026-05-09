@@ -1,0 +1,180 @@
+name: Daily GBPUSD tick ingest
+
+on:
+  schedule:
+    - cron: '0 8 * * 2-6'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN_WRITE }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compute target date
+        id: date
+        run: |
+          TARGET=$(date -d yesterday +%Y-%m-%d)
+          echo "target=${TARGET}" >> "$GITHUB_OUTPUT"
+
+      - name: Ingest to local
+        id: ingest
+        run: |
+          python ingest_historical.py \
+            --start ${{ steps.date.outputs.target }} \
+            --end   ${{ steps.date.outputs.target }} \
+            --output-dir /tmp/ticks
+
+      - name: Validate gaps
+        id: validate
+        run: |
+          python - <<'PYEOF'
+          import sys
+          from datetime import datetime, timezone
+          import pyarrow.parquet as pq
+
+          target = "${{ steps.date.outputs.target }}"
+          path = f"/tmp/ticks/ticks_{target}.parquet"
+
+          table = pq.read_table(path, columns=["timestamp_utc"])
+          ts = sorted(table.column("timestamp_utc").to_pylist())
+
+          # Derive window bounds for 07:00–22:00 UTC in milliseconds.
+          day_epoch_ms = int(
+              datetime.strptime(target, "%Y-%m-%d")
+              .replace(tzinfo=timezone.utc)
+              .timestamp()
+          ) * 1000
+          window_start = day_epoch_ms + 7 * 3600 * 1000
+          window_end   = day_epoch_ms + 22 * 3600 * 1000
+
+          window = [t for t in ts if window_start <= t <= window_end]
+
+          if len(window) < 2:
+              print("Fewer than 2 ticks in 07:00–22:00 UTC window — skipping gap check")
+              sys.exit(0)
+
+          diffs = [window[i + 1] - window[i] for i in range(len(window) - 1)]
+          max_gap_ms = max(diffs)
+
+          if max_gap_ms > 600_000:
+              print(
+                  f"ERROR: gap of {max_gap_ms / 60_000:.1f} min detected during "
+                  f"07:00–22:00 UTC (threshold: 10 min)",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          print(f"Gap validation passed. Max gap in window: {max_gap_ms / 60_000:.2f} min")
+          PYEOF
+
+      - name: Upload to HF
+        id: upload
+        if: steps.validate.outcome == 'success'
+        run: |
+          python - <<'PYEOF'
+          import hashlib
+          import json
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          import pyarrow.parquet as pq
+          from huggingface_hub import HfApi
+
+          REPO_ID = "FXQuantBench/fx-ticks"
+          REPO_TYPE = "dataset"
+
+          target = "${{ steps.date.outputs.target }}"
+          local_path = Path(f"/tmp/ticks/ticks_{target}.parquet")
+
+          y, m, d = target.split("-")
+          hf_path = f"GBPUSD/{y}/{m}/{d}/ticks_{target}.parquet"
+
+          api = HfApi()
+          api.upload_file(
+              path_or_fileobj=str(local_path),
+              path_in_repo=hf_path,
+              repo_id=REPO_ID,
+              repo_type=REPO_TYPE,
+          )
+          print(f"Uploaded {hf_path}")
+
+          # Compute SHA256.
+          h = hashlib.sha256()
+          with open(local_path, "rb") as f:
+              for chunk in iter(lambda: f.read(65536), b""):
+                  h.update(chunk)
+          checksum = h.hexdigest()
+
+          row_count = pq.read_metadata(str(local_path)).num_rows
+
+          # Download current manifest, update entry, re-upload.
+          try:
+              manifest_cached = api.hf_hub_download(
+                  repo_id=REPO_ID,
+                  filename="manifest.json",
+                  repo_type=REPO_TYPE,
+              )
+              with open(manifest_cached) as f:
+                  manifest = json.load(f)
+          except Exception:
+              manifest = {"files": [], "last_updated": None}
+
+          manifest["files"] = [e for e in manifest["files"] if e.get("path") != hf_path]
+          manifest["files"].append(
+              {
+                  "path": hf_path,
+                  "rows": row_count,
+                  "sha256": checksum,
+                  "date": target,
+              }
+          )
+          manifest["last_updated"] = datetime.now(tz=timezone.utc).isoformat()
+
+          api.upload_file(
+              path_or_fileobj=json.dumps(manifest, indent=2).encode(),
+              path_in_repo="manifest.json",
+              repo_id=REPO_ID,
+              repo_type=REPO_TYPE,
+          )
+          print("Updated manifest.json")
+          PYEOF
+
+      - name: Open issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const steps = {
+              'Ingest to local': '${{ steps.ingest.outcome }}',
+              'Validate gaps':   '${{ steps.validate.outcome }}',
+              'Upload to HF':    '${{ steps.upload.outcome }}',
+            };
+            const failed = Object.entries(steps).find(([, v]) => v === 'failure');
+            const stepName = failed ? failed[0] : 'unknown step';
+            const target = '${{ steps.date.outputs.target }}';
+            const runUrl =
+              `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: `Daily ingest failure: ${target}`,
+              body: [
+                `**Failed step:** ${stepName}`,
+                `**Date:** ${target}`,
+                `**Run:** ${runUrl}`,
+              ].join('\n'),
+            });
