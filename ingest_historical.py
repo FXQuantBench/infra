@@ -237,6 +237,25 @@ def upload_and_update_manifest(api: HfApi, local_path: Path, day: date) -> None:
     print("  Updated manifest.json")
 
 
+def _load_uploaded_paths(api: HfApi) -> set[str]:
+    """Return the set of HF paths already recorded in manifest.json.
+
+    Used by upload mode to skip days that were successfully uploaded in a
+    previous run, allowing resume after an unexpected failure.
+    """
+    try:
+        manifest_path = api.hf_hub_download(
+            repo_id=REPO_ID,
+            filename="manifest.json",
+            repo_type=REPO_TYPE,
+        )
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        return {e["path"] for e in manifest.get("files", [])}
+    except Exception:
+        return set()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Ingest GBPUSD ticks from Dukascopy")
     parser.add_argument(
@@ -292,9 +311,37 @@ def main() -> None:
         raw_dir = Path(args.raw_dir)
         raw_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- Resume support ---
+    # In local mode: skip days whose output file already exists on disk.
+    # In upload mode: fetch the manifest once and skip days already uploaded.
+    uploaded_paths: set[str] = set()
+    if not local_mode:
+        print("Fetching manifest to determine already-uploaded days ...")
+        uploaded_paths = _load_uploaded_paths(api)
+        if uploaded_paths:
+            print(f"  {len(uploaded_paths)} day(s) already in manifest — will skip.")
+
     current = start
     while current <= end:
         print(f"Processing {current.isoformat()} ...")
+
+        # Resume check — skip days already completed.
+        if local_mode:
+            local_path = output_dir / f"ticks_{current.isoformat()}.parquet"
+            if local_path.exists():
+                print("  Already exists locally — skipping")
+                current += timedelta(days=1)
+                continue
+        else:
+            hf_path = (
+                f"GBPUSD/{current.year}/{current.month:02d}/{current.day:02d}"
+                f"/ticks_{current.isoformat()}.parquet"
+            )
+            if hf_path in uploaded_paths:
+                print("  Already in manifest — skipping")
+                current += timedelta(days=1)
+                continue
+
         try:
             df = fetch_ticks(current, raw_dir=raw_dir)
         except Exception as exc:

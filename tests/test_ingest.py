@@ -12,6 +12,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from ingest_historical import (
+    _load_uploaded_paths,
     _save_raw,
     _to_ms,
     default_end,
@@ -413,3 +414,131 @@ class TestMain:
         ):
             with pytest.raises(SystemExit):
                 main()
+
+
+# ---------------------------------------------------------------------------
+# _load_uploaded_paths
+# ---------------------------------------------------------------------------
+
+
+class TestLoadUploadedPaths:
+    def test_returns_paths_from_manifest(self, tmp_path):
+        manifest = {
+            "files": [
+                {"path": "GBPUSD/2023/01/01/ticks_2023-01-01.parquet"},
+                {"path": "GBPUSD/2023/01/02/ticks_2023-01-02.parquet"},
+            ],
+            "last_updated": "2023-01-02T00:00:00+00:00",
+        }
+        manifest_file = tmp_path / "manifest.json"
+        manifest_file.write_text(json.dumps(manifest))
+
+        api = MagicMock()
+        api.hf_hub_download.return_value = str(manifest_file)
+
+        result = _load_uploaded_paths(api)
+        assert result == {
+            "GBPUSD/2023/01/01/ticks_2023-01-01.parquet",
+            "GBPUSD/2023/01/02/ticks_2023-01-02.parquet",
+        }
+
+    def test_returns_empty_set_when_manifest_missing(self):
+        api = MagicMock()
+        api.hf_hub_download.side_effect = Exception("not found")
+        assert _load_uploaded_paths(api) == set()
+
+    def test_returns_empty_set_when_files_list_empty(self, tmp_path):
+        manifest = {"files": [], "last_updated": None}
+        manifest_file = tmp_path / "manifest.json"
+        manifest_file.write_text(json.dumps(manifest))
+
+        api = MagicMock()
+        api.hf_hub_download.return_value = str(manifest_file)
+        assert _load_uploaded_paths(api) == set()
+
+
+# ---------------------------------------------------------------------------
+# Resume logic via main()
+# ---------------------------------------------------------------------------
+
+
+class TestResume:
+    @patch("ingest_historical.fetch_ticks")
+    def test_local_mode_skips_existing_file(self, mock_fetch, sample_df, tmp_path):
+        # Pre-write the file so it looks like a previous run succeeded.
+        existing = tmp_path / "ticks_2023-01-01.parquet"
+        write_parquet(sample_df, existing)
+
+        with patch.object(
+            sys, "argv",
+            ["ingest_historical.py", "--start", "2023-01-01", "--end", "2023-01-01",
+             "--output-dir", str(tmp_path)],
+        ):
+            main()
+
+        # fetch_ticks must never be called for days already on disk.
+        mock_fetch.assert_not_called()
+
+    @patch("ingest_historical.fetch_ticks")
+    def test_local_mode_processes_missing_day(self, mock_fetch, sample_df, tmp_path):
+        mock_fetch.return_value = sample_df
+        with patch.object(
+            sys, "argv",
+            ["ingest_historical.py", "--start", "2023-01-01", "--end", "2023-01-01",
+             "--output-dir", str(tmp_path)],
+        ):
+            main()
+
+        mock_fetch.assert_called_once()
+        assert (tmp_path / "ticks_2023-01-01.parquet").exists()
+
+    @patch("ingest_historical.upload_and_update_manifest")
+    @patch("ingest_historical.HfApi")
+    @patch("ingest_historical.fetch_ticks")
+    def test_upload_mode_skips_day_in_manifest(
+        self, mock_fetch, mock_hf_cls, mock_upload_manifest, tmp_path
+    ):
+        manifest = {
+            "files": [{"path": "GBPUSD/2023/01/01/ticks_2023-01-01.parquet"}],
+            "last_updated": "2023-01-01T00:00:00+00:00",
+        }
+        manifest_file = tmp_path / "manifest.json"
+        manifest_file.write_text(json.dumps(manifest))
+
+        mock_api = MagicMock()
+        mock_hf_cls.return_value = mock_api
+        mock_api.hf_hub_download.return_value = str(manifest_file)
+
+        with patch.object(
+            sys, "argv",
+            ["ingest_historical.py", "--start", "2023-01-01", "--end", "2023-01-01"],
+        ):
+            main()
+
+        mock_fetch.assert_not_called()
+        mock_upload_manifest.assert_not_called()
+
+    @patch("ingest_historical.upload_and_update_manifest")
+    @patch("ingest_historical.HfApi")
+    @patch("ingest_historical.fetch_ticks")
+    def test_upload_mode_processes_day_not_in_manifest(
+        self, mock_fetch, mock_hf_cls, mock_upload_manifest, sample_df, tmp_path
+    ):
+        manifest = {"files": [], "last_updated": None}
+        manifest_file = tmp_path / "manifest.json"
+        manifest_file.write_text(json.dumps(manifest))
+
+        mock_api = MagicMock()
+        mock_hf_cls.return_value = mock_api
+        mock_api.hf_hub_download.return_value = str(manifest_file)
+        mock_fetch.return_value = sample_df
+
+        with patch.object(
+            sys, "argv",
+            ["ingest_historical.py", "--start", "2023-01-01", "--end", "2023-01-01"],
+        ):
+            main()
+
+        mock_fetch.assert_called_once()
+        mock_upload_manifest.assert_called_once()
+
