@@ -1,6 +1,6 @@
 dukascopy-python==4.0.1
 pandas==2.2.3
-pyarrow==17.0.0
+pyarrow==18.1.0
 huggingface-hub==0.24.6
 duckdb==1.2.2
 pytest==8.3.5
