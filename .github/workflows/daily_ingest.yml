@@ -3,6 +3,11 @@ name: Daily GBPUSD tick ingest
 on:
   schedule:
     - cron: '0 8 * * 2-6'
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: 'Date to ingest (YYYY-MM-DD). Defaults to yesterday if blank.'
+        required: false
 
 permissions:
   contents: read
@@ -27,7 +32,11 @@ jobs:
       - name: Compute target date
         id: date
         run: |
-          TARGET=$(date -d yesterday +%Y-%m-%d)
+          if [ -n "${{ inputs.target_date }}" ]; then
+            TARGET="${{ inputs.target_date }}"
+          else
+            TARGET=$(date -d yesterday +%Y-%m-%d)
+          fi
           echo "target=${TARGET}" >> "$GITHUB_OUTPUT"
 
       - name: Ingest to local

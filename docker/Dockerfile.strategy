@@ -2,11 +2,11 @@ FROM python:3.13-slim
 
 RUN pip install --no-cache-dir \
     pandas==2.2.3 \
-    numpy==1.26.4 \
+    numpy==2.2.3 \
     duckdb==1.2.2 \
     pyarrow==18.1.0 \
     huggingface-hub==0.24.6 \
-    scipy==1.13.1 \
+    scipy==1.15.3 \
     vectorbt==1.0.0
 
 RUN useradd --uid 1000 --create-home runner
