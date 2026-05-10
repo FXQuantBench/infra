@@ -21,6 +21,7 @@ from ingest_historical import (
     parse_args,
     sha256_file,
     upload_and_update_manifest,
+    upload_month_batch,
     write_parquet,
 )
 from tests.helpers import BASE_MS, make_tick_df
@@ -195,7 +196,7 @@ class TestWriteParquet:
         assert result["timestamp_utc"].iloc[0] == BASE_MS
         assert result["bid"].iloc[0] == pytest.approx(1.3000)
         assert result["ask"].iloc[0] == pytest.approx(1.3002)
-        assert result["is_interpolated"].iloc[0] is False
+        assert not result["is_interpolated"].iloc[0]
 
     def test_output_columns_match_schema(self, sample_df, tmp_path):
         path = tmp_path / "out.parquet"
@@ -386,11 +387,11 @@ class TestMain:
         ):
             main()  # should not raise
 
-    @patch("ingest_historical.upload_and_update_manifest")
+    @patch("ingest_historical.upload_month_batch")
     @patch("ingest_historical.HfApi")
     @patch("ingest_historical.fetch_ticks")
-    def test_upload_mode_calls_upload_and_manifest(
-        self, mock_fetch, mock_hf_cls, mock_upload_manifest, sample_df
+    def test_upload_mode_calls_upload_month_batch(
+        self, mock_fetch, mock_hf_cls, mock_upload_batch, sample_df
     ):
         mock_fetch.return_value = sample_df
         mock_api = MagicMock()
@@ -402,10 +403,13 @@ class TestMain:
         ):
             main()
 
-        mock_upload_manifest.assert_called_once()
-        call_args = mock_upload_manifest.call_args
+        mock_upload_batch.assert_called_once()
+        call_args = mock_upload_batch.call_args
         assert call_args.args[0] is mock_api
-        assert call_args.args[2] == date(2023, 1, 1)
+        # Second arg is a list of (date, path) tuples for the month.
+        month_files = call_args.args[1]
+        assert len(month_files) == 1
+        assert month_files[0][0] == date(2023, 1, 1)
 
     def test_start_after_end_raises_system_exit(self):
         with patch.object(
@@ -492,11 +496,11 @@ class TestResume:
         mock_fetch.assert_called_once()
         assert (tmp_path / "ticks_2023-01-01.parquet").exists()
 
-    @patch("ingest_historical.upload_and_update_manifest")
+    @patch("ingest_historical.upload_month_batch")
     @patch("ingest_historical.HfApi")
     @patch("ingest_historical.fetch_ticks")
     def test_upload_mode_skips_day_in_manifest(
-        self, mock_fetch, mock_hf_cls, mock_upload_manifest, tmp_path
+        self, mock_fetch, mock_hf_cls, mock_upload_batch, tmp_path
     ):
         manifest = {
             "files": [{"path": "GBPUSD/2023/01/01/ticks_2023-01-01.parquet"}],
@@ -516,13 +520,13 @@ class TestResume:
             main()
 
         mock_fetch.assert_not_called()
-        mock_upload_manifest.assert_not_called()
+        mock_upload_batch.assert_not_called()
 
-    @patch("ingest_historical.upload_and_update_manifest")
+    @patch("ingest_historical.upload_month_batch")
     @patch("ingest_historical.HfApi")
     @patch("ingest_historical.fetch_ticks")
     def test_upload_mode_processes_day_not_in_manifest(
-        self, mock_fetch, mock_hf_cls, mock_upload_manifest, sample_df, tmp_path
+        self, mock_fetch, mock_hf_cls, mock_upload_batch, sample_df, tmp_path
     ):
         manifest = {"files": [], "last_updated": None}
         manifest_file = tmp_path / "manifest.json"
@@ -540,5 +544,5 @@ class TestResume:
             main()
 
         mock_fetch.assert_called_once()
-        mock_upload_manifest.assert_called_once()
+        mock_upload_batch.assert_called_once()
 

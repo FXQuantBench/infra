@@ -28,7 +28,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from dukascopy_python.instruments import INSTRUMENT_FX_MAJORS_GBP_USD
-from huggingface_hub import HfApi
+from huggingface_hub import CommitOperationAdd, HfApi
 
 REPO_ID = "FXQuantBench/fx-ticks"
 REPO_TYPE = "dataset"
@@ -210,6 +210,104 @@ def _hf_upload(api: HfApi, **kwargs) -> None:
                 raise
 
 
+def upload_month_batch(api: HfApi, month_files: list[tuple[date, Path]]) -> None:
+    """Upload all parquet files for a month plus an updated manifest in one commit.
+
+    Parameters
+    ----------
+    api:
+        Authenticated HfApi instance.
+    month_files:
+        Ordered list of (day, tmp_path) pairs whose data should be committed.
+    """
+    import requests
+
+    # Load current manifest.
+    try:
+        manifest_dl = api.hf_hub_download(
+            repo_id=REPO_ID,
+            filename="manifest.json",
+            repo_type=REPO_TYPE,
+        )
+        with open(manifest_dl) as f:
+            manifest = json.load(f)
+    except Exception:
+        manifest = {"files": [], "last_updated": None}
+
+    operations: list[CommitOperationAdd] = []
+    for day, tmp_path in month_files:
+        hf_path = (
+            f"GBPUSD/{day.year}/{day.month:02d}/{day.day:02d}"
+            f"/ticks_{day.isoformat()}.parquet"
+        )
+        checksum = sha256_file(tmp_path)
+        row_count = pq.read_metadata(str(tmp_path)).num_rows
+
+        operations.append(
+            CommitOperationAdd(
+                path_in_repo=hf_path,
+                path_or_fileobj=str(tmp_path),
+            )
+        )
+        manifest["files"] = [e for e in manifest["files"] if e.get("path") != hf_path]
+        manifest["files"].append(
+            {
+                "path": hf_path,
+                "rows": row_count,
+                "sha256": checksum,
+                "date": day.isoformat(),
+            }
+        )
+
+    manifest["last_updated"] = datetime.now(tz=timezone.utc).isoformat()
+    operations.append(
+        CommitOperationAdd(
+            path_in_repo="manifest.json",
+            path_or_fileobj=json.dumps(manifest, indent=2).encode(),
+        )
+    )
+
+    month_label = month_files[0][0].strftime("%Y-%m")
+    delay = 10
+    for attempt in range(6):
+        try:
+            api.create_commit(
+                repo_id=REPO_ID,
+                repo_type=REPO_TYPE,
+                operations=operations,
+                commit_message=(
+                    f"Add {month_label} ticks ({len(month_files)} days)"
+                ),
+            )
+            print(
+                f"  Uploaded {len(month_files)} day(s) for {month_label} + manifest"
+            )
+            return
+        except Exception as exc:
+            is_429 = (
+                isinstance(exc, requests.exceptions.HTTPError)
+                and exc.response is not None
+                and exc.response.status_code == 429
+            ) or "429" in str(exc)
+            if is_429 and attempt < 5:
+                print(f"  HF rate-limited, retrying in {delay}s …")
+                time.sleep(delay)
+                delay = min(delay * 2, 300)
+            else:
+                raise
+
+
+def _flush_month(api: HfApi, pending: list[tuple[date, Path]]) -> None:
+    """Commit *pending* files as a single HF commit then clean up temp files."""
+    if not pending:
+        return
+    try:
+        upload_month_batch(api, pending)
+    finally:
+        for _, p in pending:
+            p.unlink(missing_ok=True)
+
+
 def upload_and_update_manifest(api: HfApi, local_path: Path, day: date) -> None:
     hf_path = (
         f"GBPUSD/{day.year}/{day.month:02d}/{day.day:02d}"
@@ -346,6 +444,10 @@ def main() -> None:
         if uploaded_paths:
             print(f"  {len(uploaded_paths)} day(s) already in manifest — will skip.")
 
+    # Accumulate (day, tmp_path) pairs across the current month in upload mode.
+    pending_uploads: list[tuple[date, Path]] = []
+    pending_month: Optional[tuple[int, int]] = None
+
     current = start
     while current <= end:
         print(f"Processing {current.isoformat()} ...")
@@ -384,20 +486,28 @@ def main() -> None:
             write_parquet(df, local_path)
             print(f"  Written to {local_path} ({len(df):,} rows)")
         else:
-            # Write to a temp file, upload, then clean up.
+            # Write to a temp file and queue for month-end batch upload.
             tmp_fd, tmp_name = tempfile.mkstemp(suffix=".parquet")
             tmp_path = Path(tmp_name)
-            try:
-                os.close(tmp_fd)
-                write_parquet(df, tmp_path)
-                upload_and_update_manifest(api, tmp_path, current)
-                print(f"  Done ({len(df):,} rows)")
-            finally:
-                tmp_path.unlink(missing_ok=True)
+            os.close(tmp_fd)
+            write_parquet(df, tmp_path)
+            print(f"  Fetched {len(df):,} rows")
+
+            this_month = (current.year, current.month)
+            if pending_month is not None and pending_month != this_month:
+                # Month boundary — flush the completed month as a single commit.
+                _flush_month(api, pending_uploads)
+                pending_uploads = []
+            pending_month = this_month
+            pending_uploads.append((current, tmp_path))
 
         current += timedelta(days=1)
-        # Brief pause between days to avoid saturating Dukascopy's CDN and HF's API.
+        # Brief pause between days to avoid saturating Dukascopy's CDN.
         time.sleep(2)
+
+    # Flush the final (possibly partial) month.
+    if not local_mode and pending_uploads:
+        _flush_month(api, pending_uploads)
 
 
 if __name__ == "__main__":
