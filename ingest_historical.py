@@ -187,13 +187,37 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _hf_upload(api: HfApi, **kwargs) -> None:
+    """Upload a file to HF with exponential backoff on 429 rate-limit errors."""
+    import requests
+
+    delay = 10
+    for attempt in range(6):
+        try:
+            api.upload_file(**kwargs)
+            return
+        except Exception as exc:
+            is_429 = (
+                isinstance(exc, requests.exceptions.HTTPError)
+                and exc.response is not None
+                and exc.response.status_code == 429
+            ) or "429" in str(exc)
+            if is_429 and attempt < 5:
+                print(f"  HF rate-limited, retrying in {delay}s …")
+                time.sleep(delay)
+                delay = min(delay * 2, 300)
+            else:
+                raise
+
+
 def upload_and_update_manifest(api: HfApi, local_path: Path, day: date) -> None:
     hf_path = (
         f"GBPUSD/{day.year}/{day.month:02d}/{day.day:02d}"
         f"/ticks_{day.isoformat()}.parquet"
     )
 
-    api.upload_file(
+    _hf_upload(
+        api,
         path_or_fileobj=str(local_path),
         path_in_repo=hf_path,
         repo_id=REPO_ID,
@@ -228,7 +252,8 @@ def upload_and_update_manifest(api: HfApi, local_path: Path, day: date) -> None:
     )
     manifest["last_updated"] = datetime.now(tz=timezone.utc).isoformat()
 
-    api.upload_file(
+    _hf_upload(
+        api,
         path_or_fileobj=json.dumps(manifest, indent=2).encode(),
         path_in_repo="manifest.json",
         repo_id=REPO_ID,
@@ -371,9 +396,8 @@ def main() -> None:
                 tmp_path.unlink(missing_ok=True)
 
         current += timedelta(days=1)
-        # Brief pause between days to avoid saturating Dukascopy's CDN.
-        # Each day triggers up to 48 hourly-file requests (24 bid + 24 ask).
-        time.sleep(0.5)
+        # Brief pause between days to avoid saturating Dukascopy's CDN and HF's API.
+        time.sleep(2)
 
 
 if __name__ == "__main__":
