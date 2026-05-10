@@ -338,13 +338,15 @@ class TestParseArgs:
         with patch.object(
             sys, "argv",
             ["ingest_historical.py", "--start", "2023-01-01", "--end", "2023-01-31",
-             "--output-dir", "/tmp/ticks", "--raw-dir", "/tmp/raw"],
+             "--output-dir", "/tmp/ticks", "--raw-dir", "/tmp/raw",
+             "--stage-dir", "/tmp/stage"],
         ):
             args = parse_args()
         assert args.start == "2023-01-01"
         assert args.end == "2023-01-31"
         assert args.output_dir == "/tmp/ticks"
         assert args.raw_dir == "/tmp/raw"
+        assert args.stage_dir == "/tmp/stage"
 
 
 # ---------------------------------------------------------------------------
@@ -545,4 +547,121 @@ class TestResume:
 
         mock_fetch.assert_called_once()
         mock_upload_batch.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# --stage-dir staging logic
+# ---------------------------------------------------------------------------
+
+
+class TestStageDir:
+    @patch("ingest_historical.upload_month_batch")
+    @patch("ingest_historical.HfApi")
+    @patch("ingest_historical.fetch_ticks")
+    def test_staged_file_skips_dukascopy_fetch(
+        self, mock_fetch, mock_hf_cls, mock_upload_batch, sample_df, tmp_path
+    ):
+        """If a staged parquet already exists fetch_ticks must not be called."""
+        stage_dir = tmp_path / "stage"
+        stage_dir.mkdir()
+        staged = stage_dir / "ticks_2023-01-01.parquet"
+        write_parquet(sample_df, staged)
+
+        mock_api = MagicMock()
+        mock_hf_cls.return_value = mock_api
+        # Empty manifest — day not yet uploaded.
+        mock_api.hf_hub_download.side_effect = Exception("not found")
+
+        with patch.object(
+            sys, "argv",
+            ["ingest_historical.py", "--start", "2023-01-01", "--end", "2023-01-01",
+             "--stage-dir", str(stage_dir)],
+        ):
+            main()
+
+        mock_fetch.assert_not_called()
+        mock_upload_batch.assert_called_once()
+
+    @patch("ingest_historical.upload_month_batch")
+    @patch("ingest_historical.HfApi")
+    @patch("ingest_historical.fetch_ticks")
+    def test_fetch_writes_to_stage_dir(
+        self, mock_fetch, mock_hf_cls, mock_upload_batch, sample_df, tmp_path
+    ):
+        """Fetched data should be written as a stable file inside --stage-dir."""
+        stage_dir = tmp_path / "stage"
+        stage_dir.mkdir()
+        mock_fetch.return_value = sample_df
+        mock_api = MagicMock()
+        mock_hf_cls.return_value = mock_api
+        mock_api.hf_hub_download.side_effect = Exception("not found")
+
+        with patch.object(
+            sys, "argv",
+            ["ingest_historical.py", "--start", "2023-01-01", "--end", "2023-01-01",
+             "--stage-dir", str(stage_dir)],
+        ):
+            main()
+
+        assert (stage_dir / "ticks_2023-01-01.parquet").exists() is False  # deleted after commit
+        mock_upload_batch.assert_called_once()
+
+    @patch("ingest_historical.upload_month_batch")
+    @patch("ingest_historical.HfApi")
+    @patch("ingest_historical.fetch_ticks")
+    def test_orphaned_staged_file_deleted_when_already_in_manifest(
+        self, mock_fetch, mock_hf_cls, mock_upload_batch, sample_df, tmp_path
+    ):
+        """A staged file whose day is already in the HF manifest should be deleted."""
+        stage_dir = tmp_path / "stage"
+        stage_dir.mkdir()
+        staged = stage_dir / "ticks_2023-01-01.parquet"
+        write_parquet(sample_df, staged)
+
+        manifest = {
+            "files": [{"path": "GBPUSD/2023/01/01/ticks_2023-01-01.parquet"}],
+            "last_updated": "2023-01-01T00:00:00+00:00",
+        }
+        manifest_file = tmp_path / "manifest.json"
+        manifest_file.write_text(json.dumps(manifest))
+
+        mock_api = MagicMock()
+        mock_hf_cls.return_value = mock_api
+        mock_api.hf_hub_download.return_value = str(manifest_file)
+
+        with patch.object(
+            sys, "argv",
+            ["ingest_historical.py", "--start", "2023-01-01", "--end", "2023-01-01",
+             "--stage-dir", str(stage_dir)],
+        ):
+            main()
+
+        assert not staged.exists()
+        mock_fetch.assert_not_called()
+        mock_upload_batch.assert_not_called()
+
+    @patch("ingest_historical.upload_month_batch")
+    @patch("ingest_historical.HfApi")
+    @patch("ingest_historical.fetch_ticks")
+    def test_staged_file_survives_upload_failure(
+        self, mock_fetch, mock_hf_cls, mock_upload_batch, sample_df, tmp_path
+    ):
+        """When the HF commit fails the staged file must NOT be deleted."""
+        stage_dir = tmp_path / "stage"
+        stage_dir.mkdir()
+        mock_fetch.return_value = sample_df
+        mock_upload_batch.side_effect = RuntimeError("HF commit failed")
+        mock_api = MagicMock()
+        mock_hf_cls.return_value = mock_api
+        mock_api.hf_hub_download.side_effect = Exception("not found")
+
+        with patch.object(
+            sys, "argv",
+            ["ingest_historical.py", "--start", "2023-01-01", "--end", "2023-01-01",
+             "--stage-dir", str(stage_dir)],
+        ):
+            with pytest.raises(RuntimeError, match="HF commit failed"):
+                main()
+
+        assert (stage_dir / "ticks_2023-01-01.parquet").exists()
 

@@ -19,6 +19,7 @@ import json
 import os
 import tempfile
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -298,14 +299,16 @@ def upload_month_batch(api: HfApi, month_files: list[tuple[date, Path]]) -> None
 
 
 def _flush_month(api: HfApi, pending: list[tuple[date, Path]]) -> None:
-    """Commit *pending* files as a single HF commit then clean up temp files."""
+    """Commit *pending* files as a single HF commit then clean up staged/temp files.
+
+    Files are deleted only after a successful commit so that a crash or rate-limit
+    failure leaves them on disk for the next run to resume from.
+    """
     if not pending:
         return
-    try:
-        upload_month_batch(api, pending)
-    finally:
-        for _, p in pending:
-            p.unlink(missing_ok=True)
+    upload_month_batch(api, pending)  # raises on failure; files survive for resume
+    for _, p in pending:
+        p.unlink(missing_ok=True)
 
 
 def upload_and_update_manifest(api: HfApi, local_path: Path, day: date) -> None:
@@ -411,6 +414,16 @@ def parse_args() -> argparse.Namespace:
             "Useful for debugging merge logic. Directory is created if it does not exist."
         ),
     )
+    parser.add_argument(
+        "--stage-dir",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Persist merged Parquet files here between runs (upload mode only). "
+            "Days already staged on disk skip Dukascopy re-fetch; files are deleted "
+            "only after a successful HF commit. Directory is created if it does not exist."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -434,6 +447,11 @@ def main() -> None:
         raw_dir = Path(args.raw_dir)
         raw_dir.mkdir(parents=True, exist_ok=True)
 
+    stage_dir: Optional[Path] = None
+    if not local_mode and args.stage_dir is not None:
+        stage_dir = Path(args.stage_dir)
+        stage_dir.mkdir(parents=True, exist_ok=True)
+
     # --- Resume support ---
     # In local mode: skip days whose output file already exists on disk.
     # In upload mode: fetch the manifest once and skip days already uploaded.
@@ -444,59 +462,98 @@ def main() -> None:
         if uploaded_paths:
             print(f"  {len(uploaded_paths)} day(s) already in manifest — will skip.")
 
-    # Accumulate (day, tmp_path) pairs across the current month in upload mode.
+    # Accumulate (day, path) pairs across the current month in upload mode.
+    # Uploads run in a single background thread so Dukascopy fetching continues
+    # while HF is resolving a rate-limit (429) back-off.
     pending_uploads: list[tuple[date, Path]] = []
     pending_month: Optional[tuple[int, int]] = None
+    upload_futures: list[Future] = []
+    upload_executor = (
+        None if local_mode else ThreadPoolExecutor(max_workers=1)
+    )
 
     current = start
     while current <= end:
         print(f"Processing {current.isoformat()} ...")
 
-        # Resume check — skip days already completed.
         if local_mode:
+            # --- Local mode ---
             local_path = output_dir / f"ticks_{current.isoformat()}.parquet"
             if local_path.exists():
                 print("  Already exists locally — skipping")
                 current += timedelta(days=1)
                 continue
+
+            try:
+                df = fetch_ticks(current, raw_dir=raw_dir)
+            except Exception as exc:
+                print(f"  WARNING: fetch failed — {exc}")
+                current += timedelta(days=1)
+                continue
+
+            if df is None:
+                print("  No data — skipping")
+                current += timedelta(days=1)
+                continue
+
+            write_parquet(df, local_path)
+            print(f"  Written to {local_path} ({len(df):,} rows)")
+
         else:
+            # --- Upload mode ---
             hf_path = (
                 f"GBPUSD/{current.year}/{current.month:02d}/{current.day:02d}"
                 f"/ticks_{current.isoformat()}.parquet"
             )
+            staged_path = (
+                stage_dir / f"ticks_{current.isoformat()}.parquet"
+                if stage_dir else None
+            )
+
             if hf_path in uploaded_paths:
                 print("  Already in manifest — skipping")
+                # Remove any orphaned staged file left from a previous partial run.
+                if staged_path and staged_path.exists():
+                    staged_path.unlink()
+                    print("  Removed orphaned staged file")
                 current += timedelta(days=1)
                 continue
 
-        try:
-            df = fetch_ticks(current, raw_dir=raw_dir)
-        except Exception as exc:
-            print(f"  WARNING: fetch failed — {exc}")
-            current += timedelta(days=1)
-            continue
+            # Use staged file if available, otherwise fetch from Dukascopy.
+            if staged_path and staged_path.exists():
+                print("  Already staged — queuing for upload without re-fetch")
+                tmp_path = staged_path
+            else:
+                try:
+                    df = fetch_ticks(current, raw_dir=raw_dir)
+                except Exception as exc:
+                    print(f"  WARNING: fetch failed — {exc}")
+                    current += timedelta(days=1)
+                    continue
 
-        if df is None:
-            print("  No data — skipping")
-            current += timedelta(days=1)
-            continue
+                if df is None:
+                    print("  No data — skipping")
+                    current += timedelta(days=1)
+                    continue
 
-        if local_mode:
-            local_path = output_dir / f"ticks_{current.isoformat()}.parquet"
-            write_parquet(df, local_path)
-            print(f"  Written to {local_path} ({len(df):,} rows)")
-        else:
-            # Write to a temp file and queue for month-end batch upload.
-            tmp_fd, tmp_name = tempfile.mkstemp(suffix=".parquet")
-            tmp_path = Path(tmp_name)
-            os.close(tmp_fd)
-            write_parquet(df, tmp_path)
-            print(f"  Fetched {len(df):,} rows")
+                if staged_path:
+                    write_parquet(df, staged_path)
+                    tmp_path = staged_path
+                    print(f"  Staged {len(df):,} rows → {staged_path.name}")
+                else:
+                    tmp_fd, tmp_name = tempfile.mkstemp(suffix=".parquet")
+                    tmp_path = Path(tmp_name)
+                    os.close(tmp_fd)
+                    write_parquet(df, tmp_path)
+                    print(f"  Fetched {len(df):,} rows")
 
             this_month = (current.year, current.month)
             if pending_month is not None and pending_month != this_month:
-                # Month boundary — flush the completed month as a single commit.
-                _flush_month(api, pending_uploads)
+                # Month boundary — submit completed month for background upload.
+                batch = list(pending_uploads)
+                upload_futures.append(
+                    upload_executor.submit(_flush_month, api, batch)
+                )
                 pending_uploads = []
             pending_month = this_month
             pending_uploads.append((current, tmp_path))
@@ -505,9 +562,16 @@ def main() -> None:
         # Brief pause between days to avoid saturating Dukascopy's CDN.
         time.sleep(2)
 
-    # Flush the final (possibly partial) month.
-    if not local_mode and pending_uploads:
-        _flush_month(api, pending_uploads)
+    # Submit the final (possibly partial) month and wait for all uploads.
+    if not local_mode:
+        if pending_uploads:
+            upload_futures.append(
+                upload_executor.submit(_flush_month, api, pending_uploads)
+            )
+        upload_executor.shutdown(wait=True)
+        # Re-raise any exception from upload threads.
+        for f in upload_futures:
+            f.result()
 
 
 if __name__ == "__main__":
