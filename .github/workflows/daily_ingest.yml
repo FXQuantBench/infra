@@ -2,7 +2,7 @@ name: Daily GBPUSD tick ingest
 
 on:
   schedule:
-    - cron: '0 8 * * 2-6'
+    - cron: '0 8 * * 1-6'
   workflow_dispatch:
     inputs:
       target_date:
