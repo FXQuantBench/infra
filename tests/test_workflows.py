@@ -127,17 +127,17 @@ class TestDailyIngestWorkflow:
         return _load("daily_ingest.yml")
 
     def test_has_schedule_trigger(self, wf):
-        assert "schedule" in wf[True]
-        assert len(wf[True]["schedule"]) >= 1
+        # Scheduling is handled externally via cron-job.org, not via GitHub's
+        # built-in schedule trigger. Workflow is invoked through workflow_dispatch.
+        assert "schedule" not in wf[True]
 
     def test_has_workflow_dispatch_trigger(self, wf):
         assert "workflow_dispatch" in wf[True]
 
     def test_schedule_is_weekdays_only(self, wf):
-        cron = wf[True]["schedule"][0]["cron"]
-        # Days field (position 4): must not include weekends (0 or 7 = Sunday, 6 = Saturday)
-        # Actual value is '2-6' meaning Tue–Sat (UTC offset for Mon–Fri market open)
-        assert cron.strip() != ""
+        # Scheduling is handled externally via cron-job.org (weekdays only).
+        # No cron expression lives in the workflow file itself.
+        pytest.skip("Cron schedule is managed by cron-job.org, not in workflow file")
 
     def test_hf_token_comes_from_secret(self, wf):
         job = next(iter(wf["jobs"].values()))
